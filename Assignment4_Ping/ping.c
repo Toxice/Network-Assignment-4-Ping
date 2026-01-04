@@ -17,7 +17,13 @@ extern char* optarg;
 
 int packet_sequence = 1; // packet sequence
 
+struct protoent *proto = NULL;
+
 #define PACKET_SIZE 64
+#define BUFFER_SIZE 1024
+#define IP_STR_LENGTH 16 // total length of IP Address plus the '/0' character to make it a legit string
+#define TIMEOUT 10
+
 /*
     struct of ICMP Packet
 */
@@ -101,11 +107,61 @@ unsigned short checksum(void *b, int len) {
 	return result;
 }
 
-/*
-    Display to the terminal
-*/
-void display(void *buffer, int bytes) {
+/**
+ * @brief displays the data received from the listener function
+ * @par Algorithm:
+ *  we know the IP header has a field named IHL (Internet Header Length) which indicates about the size of the header itself.
+ *  according to the IP RFC, the IHL counts the number of 32 bit words (4 Byte Words), since the header has atleast 5 32 bits fields, the minimum
+ *  value of IHL will be 5, since we dont have any options fields, this will always be 5.
+ *  we know need to multiply the IHL value by 4, so we get the number of bits total in the header (4Byte = 32Bit) (5 * 4Byte = 5 * 32Bit = 160Bits Total)
+ *  about the ntohs (network  to host short) function - it is used to convert a number from a Big to a Little Endian
+ *  about the inet_ntop (interent network to presentation) function - it is used to convert the IP address from a binary format
+ *  to a human readble format (string)
+ */
+void display(char *buffer, int bytes) {
 
+    char dest_addr[IP_STR_LENGTH];
+
+    // collecting the IP header
+	struct iphdr *ip = (struct iphdr *)buffer;
+	
+    // collecting the ICMP header
+	struct icmphdr *icmp = (struct icmphdr *)(buffer + ip->ihl * 4);
+
+    // collecting the source IP Address for displaying on the terminal
+    inet_ntop(AF_INET, &(ip->saddr), dest_addr, sizeof(buffer));
+
+    // printing the PING output...
+    printf("Pinging %s with %d bytes of data:\n",dest_addr, sizeof(buffer));
+    printf("%d bytes from %s: icmp_sequence = %d ttl = %d", ntohs(ip->tot_len), dest_addr, ntohs(icmp->un.echo.sequence), ip->ttl);
+}
+
+void listener(void) {
+    int sock;
+    struct sockaddr_in addr;
+	unsigned char buffer[BUFFER_SIZE];
+
+    sock = socket(PF_INET, SOCK_RAW, proto->p_proto);
+	if (sock < 0)
+	{
+		perror("socket");
+		exit(0);
+	}
+    while(1)
+	{	
+		int bytes;
+        int len = sizeof(addr);
+
+		memset(buffer, 0, sizeof(buffer));
+
+		bytes = recvfrom(socket, buffer, sizeof(buffer), 0, (struct sockaddr*)&addr, &len);
+
+		if ( bytes > 0 )
+			display(buffer, bytes);
+		else
+			perror("recvfrom");
+	}
+	exit(0);
 }
 
 /**
@@ -129,6 +185,16 @@ void set_packet(icmp_packet *p_packet) {
     p_packet->icmp_header.code = ICMP_ECHO_CODE;
     p_packet->icmp_header.un.echo.id = getpid();
     p_packet->icmp_header.un.echo.sequence = packet_sequence++;
+}
+
+void set_sockaddr_in(char *ip_addr, struct sockaddr_in dest_address) {
+    memset(&dest_address, 0, sizeof(dest_address));
+    dest_address.sin_family = AF_INET;
+    dest_address.sin_port = 0;
+
+    if (inet_pton(AF_INET, ip_addr, &dest_address.sin_addr) <= 0) {
+        perror("Invalid IP Address");
+    }
 }
 
 /*
@@ -157,10 +223,18 @@ p_packet.icmp_header->checksum = checksum(p_packet->message, strlen(p_packet->me
  * socket before we even send one, it could be a packet who was waiting before to be sent, so we need to check for a ghost packet like that and drop it
  */
 void ping(struct sockaddr_in *address, int number_of_pings) {
-    int ttl_config = 256;
+    int ttl_config = 255;
     icmp_packet packet;
 
-    struct sockaddr_in r_addr;
+    struct sockaddr_in receive_address;
+
+    int sock_options_ttl;
+
+    int sock_options_timeout;
+
+    struct timeval timeout;
+    timeout.tv_sec = TIMEOUT; // 10 seconds  
+    timeout.tv_usec = 0;
 
     int sock;
 
@@ -170,21 +244,24 @@ void ping(struct sockaddr_in *address, int number_of_pings) {
         // might happen if not runned by the Admin, or by failure of memory allocation
     }
 
-    int sock_options = setsockopt(sock, SOL_IP, IP_TTL, &ttl_config, sizeof(ttl_config));
-    if (sock_options != 0) {
+    sock_options_ttl = setsockopt(sock, SOL_IP, IP_TTL, &ttl_config, sizeof(ttl_config));
+    if (sock_options_ttl != 0) {
         perror("Set TTL option");
         return;
     }
 
-    int socket_non_blocking_flag = fcntl(sock, F_SETFL, O_NONBLOCK);
-    if (socket_non_blocking_flag != 0) {
-        perror("Request Non Blocking I/O");
+    // setting up a timer of 10 sseconds
+    sock_options_timeout = setsockopt(sock, SOL_SOCKET, SO_RCVTIMEO, &timeout, sizeof(timeout));
+    if (sock_options_timeout != 0) {
+        perror("set timeout option");
+        return;
     }
 
+
     for(int i = 0; i < number_of_pings; i++) {
-        int len = sizeof(r_addr);
+        int len = sizeof(receive_address);
 		printf("Msg #%d\n",packet_sequence);
-		if (recvfrom(sock, &packet, sizeof(packet), 0, (struct sockaddr*)&r_addr, &len) > 0) {
+		if (recvfrom(sock, &packet, sizeof(packet), 0, (struct sockaddr*)&receive_address, &len) > 0) {
             printf("***Got message!***\n");
         }
 
@@ -198,8 +275,7 @@ void ping(struct sockaddr_in *address, int number_of_pings) {
 }
 
 int pid = -1; // process ID
-
-struct protoent *proto = NULL; // offical name of the protocol
+ // offical name of the protocol
 /**
  * @details structure of CLI is: ./ping <options flags> <host ip>
  * were using the getopt() function to simlify the process
@@ -207,17 +283,18 @@ struct protoent *proto = NULL; // offical name of the protocol
  */
 int main(int argc, char *argv[]) {
     int opt;
+    int pton_desc = -1;
 
-    struct sockaddr_in address;
+    struct sockaddr_in dest_address;
 
-    char *ip_addr = NULL; // placeholder for the IP (-a)
+    char *ip_address = NULL; // placeholder for the IP (-a)
     int loops = 0; // place holder for the number of times to ping the address (-c)
     int is_flood = 0; // placeholder for the flood flag (-f)
 
-    while( (opt = getopt(argc, argv, "a:c:f")) != -1) {
+    while((opt = getopt(argc, argv, "a:c:f")) != -1) {
         switch (opt) {
             case 'a':
-                ip_addr = optarg;
+                ip_address = optarg;
                 break;
             case 'c':
                 loops = atoi(optarg);
@@ -233,10 +310,9 @@ int main(int argc, char *argv[]) {
         }
     }
 
+    set_sockaddr_in(ip_address, dest_address);
+
     proto = getprotobyname("ICMP");
-    
-    fprintf(stdout, "hello"); // what to show
-    return 0;
     }
 
 
