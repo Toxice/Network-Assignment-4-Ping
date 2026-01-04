@@ -11,16 +11,19 @@
 #include <poll.h>
 #include <unistd.h>
 #include <netdb.h>
+#include <fcntl.h>
 
 extern char* optarg;
+
+int packet_sequence = 1; // packet sequence
 
 #define PACKET_SIZE 64
 /*
     struct of ICMP Packet
 */
 typedef struct {
-struct icmphdr *icmp_header;
-char *message[PACKET_SIZE - sizeof(struct icmphdr)];
+struct icmphdr icmp_header;
+char message[PACKET_SIZE - sizeof(struct icmphdr)];
 } icmp_packet;
 
 char payload[PACKET_SIZE - sizeof(struct icmphdr)] = "ABCDEFGHIJKLMNOP";
@@ -44,9 +47,7 @@ char payload[PACKET_SIZE - sizeof(struct icmphdr)] = "ABCDEFGHIJKLMNOP";
  */
 
 #define TIMEOUT_SEC 10000 // timeout of maximum 10 seconds (counted as 10,000 miliseconds)
-#define ICMP_ECHO_REQUEST 8 // ICMP Type FLAG
-#define ICMP_ECHO_RESPONSE 0 // ICMP Type FLAG
-#define IDENTIFIER 0 // ICMP Identifier 
+#define ICMP_ECHO_CODE 0 // ICMP Echo Code
 #define BUFFER_SIZE 1024 // size on bytes
 
 /**
@@ -107,10 +108,92 @@ void display(void *buffer, int bytes) {
 
 }
 
-/*
+/**
+ * @brief sets the packet to the desired values (sets the packet as an ECHO Request Packet)
+ * 
+ * @param *p_packet - Pointer to an ICMP Packet
+ * 
+ * @par Setup:
+ *  sets the ICMP Packet with the proper values an an ECHO REQUEST
+ *  sets the checksum
+ *  sets the type as ECHO REQUEST (8) -> (00001000)
+ *  sets the code as ECHO CODE (0)
+ *  sets the ID as the process id
+ *  the sequence global variable sequence as 1, sets the packet and then accumalate it by one every time
+ */
+void set_packet(icmp_packet *p_packet) {
+    memset(p_packet, 0, sizeof(icmp_packet));
+    memcpy(p_packet->message, payload, sizeof(p_packet->message));
+    p_packet->icmp_header.checksum = checksum(p_packet, sizeof(p_packet));
+    p_packet->icmp_header.type = ICMP_ECHO;
+    p_packet->icmp_header.code = ICMP_ECHO_CODE;
+    p_packet->icmp_header.un.echo.id = getpid();
+    p_packet->icmp_header.un.echo.sequence = packet_sequence++;
+}
 
+/*
+p_packet.icmp_header->checksum = checksum(p_packet->message, strlen(p_packet->message));
+    p_packet->icmp_header->type = ICMP_ECHO_TYPE_REQUEST;
+    p_packet->icmp_header->code = ICMP_CODE;
+    p_packet->icmp_header->un.echo.id = htons(getpid());
+    p_packet->icmp_header->un.echo.sequence = packet_sequence++;
 */
-void ping(struct sockaddr_in *address) {
+
+/**
+ * @brief sending ICMP Packet to the address we want
+ * @par Alggorithm
+ * first - we set the ICMP Packet to Zero, to ensure theres not garbage values inside
+ * we set up the socket as a raw socket ready to receive ICMP Packets
+ * now we need to set configurations for the socket.
+ * we need it to use the socket identifier we used before and we need it to be at the Network Layer, hence SOL_IP (Socket Layer IP)
+ * so we use the flags SOL_IP (Socket Layer IP), IP_TTL (IP Time To Live) and set the TTL value with the variable ttl_config.
+ * since Linux sets a prefixed value when Pinging, we want to set our own TTL, so we can know how many hoppers (routers) 
+ * were used to reach the destination
+ * since the Linux Kernel has control on scheduling the Ping Process (as well as all other processes (programs)) running, he will let it run once
+ * and then immediately halt it until a packet arrives.
+ * since we can't wait forever for a packet to arrive we can't allow that.
+ * we set the process to be of non blocking nature, and set up a timer of 10 seconds for a packet to arrive.
+ * in the ping loop - were checking for a receivied packet before sending a packet, when creating the socket a packet might arrive to the
+ * socket before we even send one, it could be a packet who was waiting before to be sent, so we need to check for a ghost packet like that and drop it
+ */
+void ping(struct sockaddr_in *address, int number_of_pings) {
+    int ttl_config = 256;
+    icmp_packet packet;
+
+    struct sockaddr_in r_addr;
+
+    int sock;
+
+    sock = socket(PF_INET, SOCK_RAW, proto->p_proto); // setting up the socket as a raw socket for ICMP (PF_INET is basically the same as AF_INET)
+    if (sock < 0) {
+        perror("socket");
+        // might happen if not runned by the Admin, or by failure of memory allocation
+    }
+
+    int sock_options = setsockopt(sock, SOL_IP, IP_TTL, &ttl_config, sizeof(ttl_config));
+    if (sock_options != 0) {
+        perror("Set TTL option");
+        return;
+    }
+
+    int socket_non_blocking_flag = fcntl(sock, F_SETFL, O_NONBLOCK);
+    if (socket_non_blocking_flag != 0) {
+        perror("Request Non Blocking I/O");
+    }
+
+    for(int i = 0; i < number_of_pings; i++) {
+        int len = sizeof(r_addr);
+		printf("Msg #%d\n",packet_sequence);
+		if (recvfrom(sock, &packet, sizeof(packet), 0, (struct sockaddr*)&r_addr, &len) > 0) {
+            printf("***Got message!***\n");
+        }
+
+        set_packet(&packet);
+        if (sendto(sock, &packet, sizeof(packet), 0, (struct sockaddr*)address, sizeof(*address)) <= 0) {
+            perror("sendto");
+        }
+        sleep(1);
+    }
 
 }
 
