@@ -7,22 +7,56 @@
 #include <sys/socket.h>
 #include <sys/time.h>
 #include <errno.h>
-#include <signal.h>
 #include <poll.h>
 #include <unistd.h>
 #include <netdb.h>
 #include <fcntl.h>
+#include <sys/wait.h>
+#include <sys/types.h>
+#include <signal.h>
+#include <sys/mman.h>
 
-extern char* optarg;
+#define _POSIX_C_SOURCE 200809L
+
+extern char *optarg;
+
+char *ip_address = NULL; // placeholder for the IP (-a)
 
 int packet_sequence = 1; // packet sequence
+
+int flood_flag = 0; // placeholder for the flood flag (-f)
+
+int sock = -1; // global socket descriptor 
 
 struct protoent *proto = NULL;
 
 #define PACKET_SIZE 64
 #define BUFFER_SIZE 1024
 #define IP_STR_LENGTH 16 // total length of IP Address plus the '/0' character to make it a legit string
-#define TIMEOUT 10
+#define TIMEOUT 10000 // timeout of 10 seconds, counted as 10,000 miliseconds
+
+#define ICMP_ECHO_CODE 0 // ICMP Echo Code
+#define BUFFER_SIZE 1024 // size on bytes
+
+#define MAX 1000000.0
+
+double sum_rtt = 0;
+double min_rtt = 0;
+double max_rtt = 0;
+double avg_rtt = 0;
+
+double *p_avg = &avg_rtt;
+
+
+typedef struct {
+    int packets_received;
+    double sum_rtt;
+    double min_rtt;
+    double max_rtt;
+} ping_stats_t;
+
+ping_stats_t *shared_stats = NULL; // Global pointer to shared memory
+
 
 /*
     struct of ICMP Packet
@@ -32,7 +66,6 @@ struct icmphdr icmp_header;
 char message[PACKET_SIZE - sizeof(struct icmphdr)];
 } icmp_packet;
 
-char payload[PACKET_SIZE - sizeof(struct icmphdr)] = "ABCDEFGHIJKLMNOP";
 
 /**
  * @brief this is a PING program, similar to the ping we know and love,
@@ -51,10 +84,6 @@ char payload[PACKET_SIZE - sizeof(struct icmphdr)] = "ABCDEFGHIJKLMNOP";
     64 bytes from 8.8.8.8: icmp_seq=4 ttl=117 time=8.450ms    = 
 ===============================================================
  */
-
-#define TIMEOUT_SEC 10000 // timeout of maximum 10 seconds (counted as 10,000 miliseconds)
-#define ICMP_ECHO_CODE 0 // ICMP Echo Code
-#define BUFFER_SIZE 1024 // size on bytes
 
 /**
  * @brief sums up all of the packet data and summing back any leftover bits and NOTing the value in the end
@@ -107,6 +136,33 @@ unsigned short checksum(void *b, int len) {
 	return result;
 }
 
+void set_min(double current_rtt) {
+    if (current_rtt < (shared_stats->min_rtt)) {
+        shared_stats->min_rtt = current_rtt;
+    }
+}
+
+void set_max(double current_rtt) {
+    if (current_rtt > shared_stats->max_rtt) {
+        shared_stats->max_rtt = current_rtt;
+    }
+}
+
+/**
+ * @brief calculate the RTT of a packet
+ */
+double get_round_trip_time(struct timeval *start, struct timeval *end) {
+    long seconds = end->tv_sec - start->tv_sec;
+    long microseconds = end->tv_usec - start->tv_usec;
+
+    if (microseconds < 0) {
+        microseconds += 1000000;
+        seconds -= 1;
+    }
+
+    return (seconds * 1000.0) + (microseconds / 1000.0);
+}
+
 /**
  * @brief displays the data received from the listener function
  * @par Algorithm:
@@ -120,28 +176,59 @@ unsigned short checksum(void *b, int len) {
  */
 void display(char *buffer, int bytes) {
 
-    char dest_addr[IP_STR_LENGTH];
+    char src_addr[IP_STR_LENGTH];
+
+    struct timeval time_recv, time_sent;
+    memset(&time_recv, 0, sizeof(struct timeval));
+    memset(&time_sent, 0, sizeof(struct timeval));
+
+    double rtt_micro_seconds = 0.0;
+
+    gettimeofday(&time_recv, NULL);
 
     // collecting the IP header
 	struct iphdr *ip = (struct iphdr *)buffer;
 	
-    // collecting the ICMP header
+    // collecting the ICMP header (were skipping the entire IP header)
 	struct icmphdr *icmp = (struct icmphdr *)(buffer + ip->ihl * 4);
 
     // collecting the source IP Address for displaying on the terminal
-    inet_ntop(AF_INET, &(ip->saddr), dest_addr, sizeof(buffer));
+    inet_ntop(AF_INET, &(ip->saddr), src_addr, IP_STR_LENGTH);
+
+    struct timeval *p_time_payload = (struct timeval*)((char*)icmp + sizeof(icmp));
+
+    memcpy(&time_sent, p_time_payload, sizeof(struct timeval));
+
+    rtt_micro_seconds = get_round_trip_time(&time_sent, &time_recv);
+
+    // making sure we only print to the terminal when the response packet is of type ECHO Reply (0)
+    if (icmp->type == ICMP_ECHOREPLY) {
+        shared_stats->packets_received++;
+        shared_stats->sum_rtt += rtt_micro_seconds;
+        set_max(rtt_micro_seconds);
+        set_min(rtt_micro_seconds);
 
     // printing the PING output...
-    printf("Pinging %s with %d bytes of data:\n",dest_addr, sizeof(buffer));
-    printf("%d bytes from %s: icmp_sequence = %d ttl = %d", ntohs(ip->tot_len), dest_addr, ntohs(icmp->un.echo.sequence), ip->ttl);
+    printf("%d bytes from %s: icmp_sequence = %d ttl = %d time = %.3f ms \n", 
+    ntohs(ip->tot_len),
+    src_addr,
+    ntohs(icmp->un.echo.sequence),
+    ip->ttl,
+    rtt_micro_seconds);
+    } else {
+        // do nothing - if we got a non ICMP ECHO REPLY we dont process it
+    }
 }
 
 void listener(void) {
-    int sock;
     struct sockaddr_in addr;
 	unsigned char buffer[BUFFER_SIZE];
 
-    sock = socket(PF_INET, SOCK_RAW, proto->p_proto);
+    struct pollfd pfd[1];
+
+    pfd[0].fd = sock;
+    pfd[0].events = POLLIN;
+
 	if (sock < 0)
 	{
 		perror("socket");
@@ -149,19 +236,31 @@ void listener(void) {
 	}
     while(1)
 	{	
-		int bytes;
-        int len = sizeof(addr);
+        int ret = poll(pfd, 1, TIMEOUT);
 
-		memset(buffer, 0, sizeof(buffer));
+        if (ret == -1) {
+            perror("poll error");
+            exit(1);
+        } else if (ret == 0) {
+            printf("timeout event: no packet was reached for 10 seconds, exisitng.\n");
+            break;
+        } 
 
-		bytes = recvfrom(socket, buffer, sizeof(buffer), 0, (struct sockaddr*)&addr, &len);
+        if (pfd[0].revents & POLLIN) {
+            socklen_t len = sizeof(addr);
+		    memset(buffer, 0, sizeof(buffer));
 
-		if ( bytes > 0 )
-			display(buffer, bytes);
-		else
-			perror("recvfrom");
-	}
-	exit(0);
+            int bytes;
+
+            bytes = recvfrom(sock, buffer, sizeof(buffer), 0, (struct sockaddr*)&addr, &len);
+
+            if ( bytes > 0 ) {
+                display((char*)buffer, bytes);
+                } else {
+                    perror("recvfrom failed");
+                } 
+        }
+    }
 }
 
 /**
@@ -179,31 +278,32 @@ void listener(void) {
  */
 void set_packet(icmp_packet *p_packet) {
     memset(p_packet, 0, sizeof(icmp_packet));
-    memcpy(p_packet->message, payload, sizeof(p_packet->message));
-    p_packet->icmp_header.checksum = checksum(p_packet, sizeof(p_packet));
-    p_packet->icmp_header.type = ICMP_ECHO;
-    p_packet->icmp_header.code = ICMP_ECHO_CODE;
-    p_packet->icmp_header.un.echo.id = getpid();
-    p_packet->icmp_header.un.echo.sequence = packet_sequence++;
+    memset(p_packet->message, 0, sizeof(p_packet->message));
+
+    p_packet->icmp_header.type = ICMP_ECHO; // Type of ECHO Request (8)
+    p_packet->icmp_header.code = ICMP_ECHO_CODE; // Code of ECHO Request 90
+    p_packet->icmp_header.un.echo.id = getpid(); // inherited from the process's ID
+    p_packet->icmp_header.un.echo.sequence = htons(packet_sequence++); // set as 1 at the beggining, jump by one every iteration
+
+    struct timeval packet_sent_time;
+    gettimeofday(&packet_sent_time, NULL);
+
+    memset(p_packet->message, 0, sizeof(struct timeval));
+    memcpy(p_packet->message, &packet_sent_time, sizeof(struct timeval));
+
+    p_packet->icmp_header.checksum = checksum(p_packet, sizeof(icmp_packet)); // calculating Checksum of the packet, must be calculated last (after we set all the packet's parameters)
 }
 
-void set_sockaddr_in(char *ip_addr, struct sockaddr_in dest_address) {
-    memset(&dest_address, 0, sizeof(dest_address));
-    dest_address.sin_family = AF_INET;
-    dest_address.sin_port = 0;
+void set_sockaddr_in(char *ip_addr, struct sockaddr_in *dest_address) {
+    memset(dest_address, 0, sizeof(*dest_address));
+    dest_address->sin_family = AF_INET;
+    dest_address->sin_port = 0;
 
-    if (inet_pton(AF_INET, ip_addr, &dest_address.sin_addr) <= 0) {
+    if (inet_pton(AF_INET, ip_addr, &dest_address->sin_addr) <= 0) {
         perror("Invalid IP Address");
+        exit(EXIT_FAILURE);
     }
 }
-
-/*
-p_packet.icmp_header->checksum = checksum(p_packet->message, strlen(p_packet->message));
-    p_packet->icmp_header->type = ICMP_ECHO_TYPE_REQUEST;
-    p_packet->icmp_header->code = ICMP_CODE;
-    p_packet->icmp_header->un.echo.id = htons(getpid());
-    p_packet->icmp_header->un.echo.sequence = packet_sequence++;
-*/
 
 /**
  * @brief sending ICMP Packet to the address we want
@@ -226,24 +326,19 @@ void ping(struct sockaddr_in *address, int number_of_pings) {
     int ttl_config = 255;
     icmp_packet packet;
 
-    struct sockaddr_in receive_address;
-
-    int sock_options_ttl;
-
-    int sock_options_timeout;
-
-    struct timeval timeout;
+     struct timeval timeout;
     timeout.tv_sec = TIMEOUT; // 10 seconds  
     timeout.tv_usec = 0;
 
-    int sock;
+    int sock_options_ttl;
+    int sock_options_timeout;
 
-    sock = socket(PF_INET, SOCK_RAW, proto->p_proto); // setting up the socket as a raw socket for ICMP (PF_INET is basically the same as AF_INET)
     if (sock < 0) {
         perror("socket");
         // might happen if not runned by the Admin, or by failure of memory allocation
     }
 
+     // setting TTL configurations
     sock_options_ttl = setsockopt(sock, SOL_IP, IP_TTL, &ttl_config, sizeof(ttl_config));
     if (sock_options_ttl != 0) {
         perror("Set TTL option");
@@ -257,19 +352,15 @@ void ping(struct sockaddr_in *address, int number_of_pings) {
         return;
     }
 
-
+    // the actual ping loop
     for(int i = 0; i < number_of_pings; i++) {
-        int len = sizeof(receive_address);
-		printf("Msg #%d\n",packet_sequence);
-		if (recvfrom(sock, &packet, sizeof(packet), 0, (struct sockaddr*)&receive_address, &len) > 0) {
-            printf("***Got message!***\n");
-        }
 
         set_packet(&packet);
+
         if (sendto(sock, &packet, sizeof(packet), 0, (struct sockaddr*)address, sizeof(*address)) <= 0) {
             perror("sendto");
         }
-        sleep(1);
+        if (flood_flag == 0) sleep(1);
     }
 
 }
@@ -283,13 +374,10 @@ int pid = -1; // process ID
  */
 int main(int argc, char *argv[]) {
     int opt;
-    int pton_desc = -1;
 
     struct sockaddr_in dest_address;
 
-    char *ip_address = NULL; // placeholder for the IP (-a)
-    int loops = 0; // place holder for the number of times to ping the address (-c)
-    int is_flood = 0; // placeholder for the flood flag (-f)
+    int loops = 1; // place holder for the number of times to ping the address (-c)
 
     while((opt = getopt(argc, argv, "a:c:f")) != -1) {
         switch (opt) {
@@ -300,19 +388,81 @@ int main(int argc, char *argv[]) {
                 loops = atoi(optarg);
                 break;
             case 'f':
-                is_flood = 1;
+                flood_flag = 1;
                 break;
             case '?':
                 fprintf(stderr, "Usage: %s -a <address> -c <count> [-f]\n", argv[0]);            
-                exit(EXIT_FAILURE);
-            default:
-                abort();    
+                exit(EXIT_FAILURE);  
         }
     }
 
-    set_sockaddr_in(ip_address, dest_address);
+    if (ip_address == NULL) {
+        fprintf(stderr, "Error: IP address required (-a)\n");
+        exit(EXIT_FAILURE);
+    }
 
+    // setting up the proto struct as ICMP
     proto = getprotobyname("ICMP");
+    if (!proto) {
+    fprintf(stderr, "Error: Could not look up ICMP protocol\n");
+    exit(EXIT_FAILURE);
+}
+
+    // setting up a raw socket, at the network level as IP socket that able to send ICMP packets
+    sock = socket(PF_INET, SOCK_RAW, proto->p_proto);
+    if (sock < 0) {
+        perror("socket");
+    }
+
+    // setting up the sockaddr_in struct to the IP we wish to send to
+    set_sockaddr_in(ip_address, &dest_address);
+
+    printf("Pinging %s with %d bytes of data:\n",ip_address, PACKET_SIZE);
+
+    // counts the amount of received packets
+    //packets_received = mmap(NULL, sizeof(int), PROT_READ | PROT_WRITE, MAP_SHARED | MAP_ANONYMOUS, -1, 0);
+    //*packets_received = 0;
+
+    shared_stats = mmap(NULL, sizeof(ping_stats_t)
+    , PROT_READ | PROT_WRITE,
+     MAP_SHARED | MAP_ANONYMOUS, -1, 0);
+
+    // Initialize shared memory
+    shared_stats->packets_received = 0;
+    shared_stats->sum_rtt = 0;
+    shared_stats->min_rtt = MAX;
+    shared_stats->max_rtt = 0;
+
+    // forking the kernel to get a child process
+    pid_t process_id = fork();
+
+    if (process_id < 0) {
+        perror("fork failed");
+        exit(1);
+    }
+
+    if (process_id == 0) {
+        // calling the child process
+        listener();
+        exit(0);
+    } else {
+        // calling the parent process
+        ping(&dest_address, loops);
+
+        sleep(1); // let the listener a chance to catch the last packet
+    }
+
+    printf("\n--- %s statistics ---\n", ip_address);
+    if (shared_stats->packets_received > 0 && flood_flag != 1) {
+    printf("%d packets transmitted, %d packets received\n", loops, shared_stats->packets_received);
+    printf("rtt min/avg/max = %f/%f/%f ms\n", shared_stats->min_rtt, ((shared_stats->sum_rtt)/(shared_stats->packets_received)), shared_stats->max_rtt);
+    } else if (flood_flag == 1) {
+        printf("%d packets transmitted, sent in flood mood, can't keep track of received packets\n", loops);
+    }
+     kill(process_id, SIGKILL);
+     wait(NULL);
+
+    return 0;
     }
 
 
